@@ -1,0 +1,13 @@
+# User-specified directories
+outputs/
+model/
+selfrag-eval-data/
+
+# Common Python/cache artifacts
+__pycache__/
+*.pyc
+.venv/
+.venv_vllm027/
+
+# Local/tooling files
+.codex
