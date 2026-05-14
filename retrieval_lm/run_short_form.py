@@ -5,6 +5,7 @@ import spacy
 import jsonlines
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from vllm import LLM, SamplingParams
+import multiprocessing as mp
 import random
 import torch
 import os
@@ -25,12 +26,27 @@ from metrics import match, accuracy
 
 
 seed = 633
+MAX_VLLM_LOGPROBS = 20
+
+
+def _to_logprob_value(x):
+    return float(getattr(x, "logprob", x))
+
+# vLLM + CUDA requires spawn start method on Linux to avoid
+# "Cannot re-initialize CUDA in forked subprocess".
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
 
 torch.backends.cudnn.deterministic = True
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)
+# Avoid initializing CUDA in parent process before vLLM starts worker processes.
+if torch.cuda.is_available():
+    pass
 
 
 def postprocess_answer_option_conditioned(answer):
@@ -50,12 +66,12 @@ def postprocess_answer_option_conditioned(answer):
 
 def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15,
                                      ret_tokens=None, rel_tokens=None, grd_tokens=None, ut_tokens=None,
-                                     use_seqscore=False, threshold=0.5,
+                                     use_seqscore=False, threshold=0.5, max_depth=2,
                                      w_rel=1.0, w_sup=1.0, w_use=0.5, mode="adaptive_retrieval", closed=False):
     results = {}
     if mode != "always_retrieve":
         sampling_params = SamplingParams(
-            temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=32016)
+            temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=MAX_VLLM_LOGPROBS)
         preds = model.generate([prompt], sampling_params)
         pred_token_ids = preds[0].outputs[0].token_ids
         pred_text = preds[0].outputs[0].text
@@ -73,10 +89,8 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
         if threshold is not None:
             score_dict = {}
             for tok, id in ret_tokens.items():
-                if id not in pred_log_probs[0]:
-                    score_dict[tok] = -100
-                prob = pred_log_probs[0][id]
-                score_dict[tok] = float(prob)
+                prob = pred_log_probs[0].get(id, -100)
+                score_dict[tok] = _to_logprob_value(prob)
             do_retrieve = score_dict["[Retrieval]"] / (
                 score_dict["[Retrieval]"] + score_dict["[No Retrieval]"]) > threshold
         else:
@@ -86,7 +100,7 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
         evidence_augmented_inputs = [prompt + "[Retrieval]<paragraph>{0}\n{1}</paragraph>".format(
             para["title"], para["text"]) for para in evidences]
         sampling_params = SamplingParams(
-            temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=5000)
+            temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=MAX_VLLM_LOGPROBS)
         preds = model.generate(evidence_augmented_inputs, sampling_params)
 
         relevance_score_dict = {}
@@ -106,7 +120,7 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
             # Compute reward scores
             for tok, id in rel_tokens.items():
                 prob = pred_log_probs[0][id] if id in pred_log_probs[0] else -100
-                relevance_score_dict[p_idx][tok] = np.exp(float(prob))
+                relevance_score_dict[p_idx][tok] = np.exp(_to_logprob_value(prob))
 
             if grd_tokens is not None:
                 groundness_token_appear_indices = []
@@ -118,7 +132,7 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
                     idx = groundness_token_appear_indices[0]
                     for token, token_id in grd_tokens.items():
                         prob = pred_log_probs[idx][token_id] if token_id in pred_log_probs[idx] else -100
-                        grd_score_dict[p_idx][token] = np.exp(float(prob))
+                        grd_score_dict[p_idx][token] = np.exp(_to_logprob_value(prob))
 
             if ut_tokens is not None:
                 utility_token_appear_indices = []
@@ -129,7 +143,7 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
                     idx = utility_token_appear_indices[0]
                     for token, token_id in ut_tokens.items():
                         prob = pred_log_probs[idx][token_id] if token_id in pred_log_probs[idx] else -100
-                        ut_score_dict[p_idx][token] = np.exp(float(prob))
+                        ut_score_dict[p_idx][token] = np.exp(_to_logprob_value(prob))
 
             relevance_score = relevance_score_dict[p_idx]["[Relevant]"] / (
                 np.sum(list(relevance_score_dict[p_idx].values())))
@@ -266,6 +280,14 @@ def main():
                         help="world size to use multiple GPUs.")
     parser.add_argument("--dtype",  type=str, default="half",
                         help="We use bfloat16 for training. If you run inference on GPUs that do not support BF16, please set this to be `half`.")
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.85,
+                        help="vLLM GPU memory utilization target. Lower to reduce OOM risk.")
+    parser.add_argument("--max_model_len", type=int, default=3072,
+                        help="Maximum sequence length for vLLM KV cache sizing.")
+    parser.add_argument("--max_num_seqs", type=int, default=256,
+                        help="Maximum concurrent sequences in vLLM scheduler; lower this to avoid sampler warm-up OOM.")
+    parser.add_argument("--enforce_eager", action="store_true",
+                        help="Disable torch.compile/CUDA graph capture to improve stability under tight VRAM.")
     # Decoding hyperparams
     parser.add_argument('--threshold', type=float,
                         default=None, help="Adaptive threshold.")
@@ -297,13 +319,28 @@ def main():
 
     input_data = preprocess_input_data(
         input_data, task=args.task)
-    tokenizer = AutoTokenizer.from_pretrained(gpt, padding_side="left")
-    if args.dtype is not None:
-        model = LLM(model=gpt, download_dir=args.download_dir,
-                    dtype=args.dtype, tensor_parallel_size=args.world_size,)
-    else:
-        model = LLM(model=gpt, download_dir=args.download_dir,
-                    dtype=args.dtype, tensor_parallel_size=args.world_size,)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(gpt, padding_side="left")
+    except ValueError as e:
+        # Some model/tokenizer combos cannot instantiate a fast tokenizer
+        # when optional backends are missing; fallback to slow tokenizer.
+        if "Couldn't instantiate the backend tokenizer" in str(e):
+            tokenizer = AutoTokenizer.from_pretrained(
+                gpt, padding_side="left", use_fast=False
+            )
+        else:
+            raise
+    llm_kwargs = dict(
+        model=gpt,
+        download_dir=args.download_dir,
+        dtype=args.dtype,
+        tensor_parallel_size=args.world_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len,
+        max_num_seqs=args.max_num_seqs,
+        enforce_eager=args.enforce_eager,
+    )
+    model = LLM(**llm_kwargs)
 
     # Get token ids for reflection tokens.
     ret_tokens, rel_tokens, grd_tokens, ut_tokens = load_special_tokens(

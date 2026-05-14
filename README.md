@@ -1,3 +1,22 @@
+# SELF-RAG Reproduction - Đồ án môn Các mô hình học sâu và ứng dụng
+
+Dự án này là phần thực nghiệm/tái hiện (reproduction) mô hình **SELF-RAG** trong khuôn khổ môn học **Các mô hình học sâu và ứng dụng**.
+
+## Thông tin nhóm
+
+- Giảng viên hướng dẫn: **TS. Lương Ngọc Hoàng**
+- Nhóm: **Nhóm 8**
+- Thành viên:
+  - Trần Lê Hải Bình - 250101007
+  - Đinh Thị Thu Hiệp - 250101085
+  - Trương Nguyễn Yến Nhi - 240101062
+  - Phan Văn Minh - 250202014
+  - Trương Gia Thạch - 240202012
+
+---
+
+## Nội dung tham chiếu từ dự án gốc
+
 # SELF-RAG: Learning to Retrieve, Generate and Critique through Self-reflection
 
 This includes the original implementation of [SELF-RAG: Learning to Retrieve, Generate and Critique through self-reflection](https://arxiv.org/abs/2310.11511) (ICLR 2024, Oral top 1%) by Akari Asai, Zeqiu Wu, Yizhong Wang, Avirup Sil, and Hannaneh Hajishirzi.

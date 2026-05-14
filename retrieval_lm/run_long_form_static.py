@@ -1,4 +1,3 @@
-import argparse
 import jsonlines
 from transformers import AutoTokenizer
 import numpy as np
@@ -11,6 +10,7 @@ from utils import TASK_INST, PROMPT_DICT, load_special_tokens, load_jsonlines, p
 def run_step_generation_batch(model, prompt, paragraphs,  max_new_tokens,
                               rel_tokens=None, grd_tokens=None, ret_tokens=None, ut_tokens=None,
                               threshold=None, w_rel=1.0, w_sup=1.0, w_use=0.5, use_seqscore=False):
+    threshold = 0.0 if threshold is None else threshold
     if paragraphs is not None:
         aug_prompts = [prompt + "[Retrieval]" + "<paragraph>{}</paragraph>".format(
             paragraph["title"] + "\n" + paragraph["text"]) for paragraph in paragraphs]
@@ -43,7 +43,8 @@ def run_step_generation_batch(model, prompt, paragraphs,  max_new_tokens,
             if id not in pred_log_probs[0]:
                 prob = -100
             else:
-                prob = np.exp(pred_log_probs[0][id])
+                # prob = np.exp(pred_log_probs[0][id])
+                prob = np.exp(pred_log_probs[0][id].logprob)
             relevance_score_dict[p_idx][tok] = prob
 
         if grd_tokens is not None:
@@ -55,7 +56,9 @@ def run_step_generation_batch(model, prompt, paragraphs,  max_new_tokens,
             if len(groundness_token_appear_indices) > 0:
                 idx = groundness_token_appear_indices[0]
                 for token, token_id in grd_tokens.items():
-                    prob = pred_log_probs[idx][token_id] if token_id in pred_log_probs[idx] else -100
+                    # prob = pred_log_probs[idx][token_id] if token_id in pred_log_probs[idx] else -100
+                    # grd_score_dict[p_idx][token] = np.exp(prob)
+                    prob = pred_log_probs[idx][token_id].logprob if token_id in pred_log_probs[idx] else -100
                     grd_score_dict[p_idx][token] = np.exp(prob)
 
         utility_token_appear_indices = []
@@ -65,8 +68,8 @@ def run_step_generation_batch(model, prompt, paragraphs,  max_new_tokens,
                     utility_token_appear_indices.append(tok_idx)
             if len(utility_token_appear_indices) > 0:
                 idx = utility_token_appear_indices[0]
-                for token, token_id in grd_tokens.items():
-                    prob = pred_log_probs[idx][token_id] if token_id in pred_log_probs[idx] else -100
+                for token, token_id in ut_tokens.items():
+                    prob = pred_log_probs[idx][token_id].logprob if token_id in pred_log_probs[idx] else -100
                     ut_score_dict[p_idx][token] = np.exp(prob)
 
         relevance_score = relevance_score_dict[p_idx]["[Relevant]"] / (
@@ -100,7 +103,7 @@ def run_step_generation_batch(model, prompt, paragraphs,  max_new_tokens,
                                  "utility_score": utility_score,
                                  "relevance_score_dict": relevance_score_dict,
                                  "grd_score_dict": grd_score_dict,
-                                 "ut_score_dict": utility_score}
+                                 "ut_score_dict": ut_score_dict}
 
         # modify and add do retrieve tokens
         if "[No Retrieval]" in pred_text:
@@ -118,14 +121,16 @@ def run_step_generation_batch(model, prompt, paragraphs,  max_new_tokens,
             for order, idx in enumerate(ret_token_appear_indices):
                 ret_token_score_dict.setdefault(order, {})
                 for tok, tok_id in ret_tokens.items():
-                    prob = pred_log_probs[idx][tok_id] if tok_id in pred_log_probs[idx] else -100
+                    # prob = pred_log_probs[idx][tok_id] if tok_id in pred_log_probs[idx] else -100
+                    # ret_token_score_dict[order][tok] = np.exp(prob)
+                    prob = pred_log_probs[idx][tok_id].logprob if tok_id in pred_log_probs[idx] else -100
                     ret_token_score_dict[order][tok] = np.exp(prob)
                 if ret_token_score_dict[order]["[Retrieval]"] + ret_token_score_dict[order]["[No Retrieval]"] != 0.0:
                     do_retrieve = (ret_token_score_dict[order]["[Retrieval]"] + ret_token_score_dict[order]["[Continue to Use Evidence]"]) / (
                         ret_token_score_dict[order]["[Retrieval]"] + ret_token_score_dict[order]["[No Retrieval]"]) > threshold
                 else:
                     do_retrieve = 0.0
-                if do_retrieve > threshold:
+                if do_retrieve:
                     retrieval_remap[order] = True
                 else:
                     retrieval_remap[order] = False
@@ -182,7 +187,7 @@ def call_model_beam_batch(prompt, model, max_new_tokens=15, ctxs=None, query=Non
             else:
                 ret_token_score_dict = {}
                 for tok, tok_id in ret_tokens.items():
-                    prob = pred_log_probs[0][tok_id]
+                    prob = pred_log_probs[0][tok_id].logprob if tok_id in pred_log_probs[0] else -100
                     ret_token_score_dict[tok] = np.exp(prob)
                 retrieve_prob = ret_token_score_dict["[Retrieval]"] / (
                     ret_token_score_dict["[Retrieval]"] + ret_token_score_dict["[No Retrieval]"])
@@ -271,7 +276,7 @@ def call_model_beam_batch(prompt, model, max_new_tokens=15, ctxs=None, query=Non
             parent = prediction_tree[current_node]["parent"]
             best_selections[path_i] = [parent] + best_selections[path_i]
             current_node = parent
-            current_level += 1
+            current_level -= 1
 
     final_prediction = {}
     splitted_sentences = {}
@@ -348,11 +353,11 @@ def main():
 
     if args.world_size is not None:
         model = LLM(model=args.model_name, download_dir=args.download_dir,
-                    dtype=args.dtype, tensor_parallel_size=args.world_size,)
+                    dtype=args.dtype, tensor_parallel_size=args.world_size, max_logprobs=32000, enforce_eager=True)
 
     else:
         model = LLM(model=args.model_name,
-                    download_dir=args.download_dir, dtype=args.dtype)
+                    download_dir=args.download_dir, dtype=args.dtype, max_logprobs=32000, enforce_eager=True)
 
     def generate(prompt, ctxs, max_new_tokens):
         processed_prompt = PROMPT_DICT["prompt_no_input"].format_map(
@@ -376,8 +381,12 @@ def main():
             ctxs = item["ctxs"][:args.ndocs]
             result, intermediate = generate(prompt, ctxs, args.max_new_tokens,)
             postprocessed_result = fix_spacing(postprocess(result[0]))
+            if "original_splitted_sentences" in intermediate and len(intermediate["original_splitted_sentences"]) > 0:
+                interm_out = intermediate["original_splitted_sentences"][0]
+            else:
+                interm_out = []
             new_results.append({"input": item["input"], "output": postprocessed_result, "topic": item["topic"],
-                                "cat": item["cat"], "intermediate": intermediate["original_splitted_sentences"][0]})
+                                "cat": item["cat"], "intermediate": interm_out})
             if idx % 10 == 0:
                 with jsonlines.open(args.output_file + "_tmp", 'w') as writer:
                     writer.write_all(new_results)
